@@ -1,0 +1,10 @@
+# Wispv1 runtime requirements.
+# On this machine use the shared interpreter: /home/ydwu/ml/ml_venv_uv/bin/python
+# (torch 2.5.1+cu121, numpy, tqdm, datasets are already installed there;
+#  tokenizers + pytest were added for this project).
+torch>=2.4
+tokenizers>=0.15
+numpy>=1.24
+tqdm>=4.65
+# dev / test only
+pytest>=7.0

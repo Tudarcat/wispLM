@@ -1,0 +1,29 @@
+Wispv1 是一个参数量很小的单模态文本模型，设计参数量约为 0.25B。
+它的目标不是通用对话，而是文本概述、文本改写缩略以及其他简单的文本处理任务。
+为了在有限的参数预算下尽可能加深网络深度，模型在注意力层和 FFN 层采用了不同的参数压缩策略。
+注意力层使用 GQA 替代 MHA，每四个查询头共享一组键值头。
+FFN 层采用 SwiGLU 激活函数，并且在前 50% 的层里，相邻两层组成一个 LayerPair，共享同一个 FFN 模块。
+在没有共享 FFN 的层里，每一层拥有独立的 FFN。
+在这些共享层中，每一条残差链接都带有一个可学习的 alpha 向量，初始化为 1e-4，形式为 g = f(x) + alpha * x。
+输入词嵌入与输出投影矩阵共享权重，这进一步减少了参数占用。
+分词器使用 QiYuanTokenizer-Small，词表大小为 24000，包含中英文混合语料上的 Unigram 子词。
+训练数据计划采用高质量的中英文混合语料，其中英文占 55%，中文占 45%。
+
+Wispv1 is a tiny monolingual text model with roughly 0.25B parameters.
+It is designed for text summarisation, rewriting and other simple text processing tasks.
+To maximise depth under a fixed parameter budget, the attention and FFN layers use different compression strategies.
+Attention uses grouped-query attention instead of multi-head attention, where every four query heads share one key/value head.
+The feed-forward network uses the SwiGLU activation, and in the first half of the layers two consecutive layers form a LayerPair that shares a single FFN module.
+Layers outside the shared region keep an independent FFN each.
+Inside the shared layers every residual connection carries a learnable alpha vector initialised to 1e-4, so that g = f(x) + alpha * x.
+The input embedding and the output projection share the same weight matrix, which saves even more parameters.
+The tokenizer is QiYuanTokenizer-Small with a vocabulary of 24,000 Unigram subwords covering Chinese and English.
+The training mixture is planned to be 55% English and 45% Chinese high-quality web text.
+
+残差连接是深度网络的关键。当 alpha 很小时，恒等路径被压缩，网络在初始化时更接近子层输出的逐层复合。
+随着训练进行，alpha 会逐渐增大，残差流被重新打开，模型能够把浅层的信息传递到更深的层。
+这种设计让很深的网络在训练初期更加稳定，同时保留了完整的表达能力。
+位置编码使用旋转位置编码 RoPE，它把位置信息注入到查询和键向量中，天然支持相对位置。
+为了缓解长文本外推崩溃的问题，可以进一步引入线性插值或动态 NTK 的 RoPE 缩放策略。
+在 SFT 阶段，需要 mask 掉提示词部分的损失，只对回答部分计算交叉熵。
+小模型是否有必要使用思维链仍然是一个开放问题，需要实验来回答。
