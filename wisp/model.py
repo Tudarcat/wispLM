@@ -49,6 +49,38 @@ class CausalLMOutput:
     past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
 
 
+def chunked_lm_loss(
+    lm_head_weight: torch.Tensor,
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Cross-entropy of the next-token prediction, computed in position chunks.
+
+    Mathematically identical to ``F.cross_entropy(logits, labels)`` with
+    ``reduction="mean"`` and ``ignore_index=-100``, but the ``[chunk, vocab]``
+    logits are freed after every chunk instead of holding ``[B, L, vocab]``.
+
+    The head is evaluated in fp32 (the logits are cast, not the weights) since
+    a bf16 log_softmax over 24k classes loses too much precision.
+    """
+    seq_len = hidden_states.size(1)
+    weight = lm_head_weight
+    total_loss = hidden_states.new_zeros(())
+    total_count = 0
+    for start in range(0, seq_len - 1, chunk_size):
+        end = min(start + chunk_size, seq_len - 1)
+        h = hidden_states[:, start:end].reshape(-1, hidden_states.size(-1)).float()
+        y = labels[:, start + 1: end + 1].reshape(-1)
+        logits = F.linear(h, weight.float())
+        n = int((y != -100).sum().item())
+        total_count += n
+        if n:
+            total_loss = total_loss + F.cross_entropy(logits, y, ignore_index=-100, reduction="sum")
+        del logits
+    return total_loss / max(total_count, 1)
+
+
 class WispModel(nn.Module):
     """The bare decoder stack (no LM head)."""
 
@@ -263,6 +295,7 @@ class WispForCausalLM(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        loss_chunk_size: int = 0,
     ) -> CausalLMOutput:
         hidden_states, presents = self.model(
             input_ids,
@@ -271,6 +304,13 @@ class WispForCausalLM(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
+        # Training with a chunked loss never materialises the full
+        # [B, L, vocab] logits tensor (B=8, L=4096, V=24000 is 1.6 GB in bf16
+        # / 3.1 GB in fp32), which is what lets a 24 GB card use big batches.
+        if labels is not None and loss_chunk_size > 0:
+            loss = chunked_lm_loss(self.lm_head.weight, hidden_states, labels, loss_chunk_size)
+            return CausalLMOutput(loss=loss, logits=None, past_key_values=presents)
+
         logits = self.lm_head(hidden_states)
         loss = None
         if labels is not None:
