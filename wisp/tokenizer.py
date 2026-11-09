@@ -165,3 +165,16 @@ class WispTokenizer:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "tokenizer_info.json"), "w", encoding="utf-8") as fh:
             json.dump(self.special_tokens_map(), fh, indent=2)
+
+
+def load_tokenizer_near(ckpt_dir: str, repo_root: Optional[str] = None) -> "WispTokenizer":
+    """Load the tokenizer shipped next to a checkpoint, else the repo's copy."""
+    root = repo_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for cand in (ckpt_dir, os.path.dirname(os.path.abspath(ckpt_dir)),
+                 os.path.join(root, "tokenizer")):
+        if os.path.exists(os.path.join(cand, "tokenizer.json")):
+            return WispTokenizer(cand)
+    raise FileNotFoundError(
+        "no tokenizer.json found next to the checkpoint or in ./tokenizer "
+        "(run scripts/download_tokenizer.py + scripts/setup_special_tokens.py)"
+    )

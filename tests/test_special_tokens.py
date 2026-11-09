@@ -220,3 +220,54 @@ def test_document_boundaries_are_not_duplicated(tok):
     assert int(a[0]) == tok.bos_token_id and int(a[-1]) == tok.eos_token_id
     assert (a == tok.user_token_id).sum() == (a == tok.assistant_token_id).sum() == 2
     assert (a == tok.end_of_turn_token_id).sum() == 4
+
+
+# ------------------------------------------------------- SFT span → mask
+def test_build_sft_sample_marks_only_assistant_turns(tok):
+    from wisp.chat import build_sft_sample, spans_to_mask
+
+    doc = parse_qa_document(ZH_DOC)
+    text, spans = build_sft_sample(doc, tok)
+    assert len(spans) == len(doc.pairs)
+    enc = tok._tok.encode(text, add_special_tokens=False)
+    mask = spans_to_mask(enc.offsets, spans)
+
+    supervised = [i for i, m in zip(enc.ids, mask) if m]
+    plain = tok.decode(supervised, skip_special_tokens=False)
+    # every answer is supervised, and so is the closing marker of each turn
+    for pair in doc.pairs:
+        assert pair.answer[:6] in plain, pair.answer[:6]
+    assert plain.count("<|end_of_turn|>") == len(doc.pairs)
+
+    dropped = [i for i, m in zip(enc.ids, mask) if not m]
+    plain_out = tok.decode(dropped, skip_special_tokens=False)
+    # prompts and the assistant marker are not trained on
+    assert "<|user|>" in plain_out
+    assert "<|assistant|>" in plain_out
+    for pair in doc.pairs:
+        assert pair.question[:6] in plain_out
+
+
+def test_build_sft_sample_span_covers_the_closing_marker(tok):
+    from wisp.chat import build_sft_sample, spans_to_mask
+
+    text, spans = build_sft_sample(parse_qa_document(EN_DOC), tok)
+    for _s, e in spans:
+        assert text[e - len(tok.reserved_name(tok.end_of_turn_token_id)):e] == \
+            tok.reserved_name(tok.end_of_turn_token_id)
+
+
+def test_sft_sample_with_system_and_task(tok):
+    from wisp.chat import build_sft_sample
+
+    text, spans = build_sft_sample(parse_qa_document(ZH_DOC), tok,
+                                   system="你是摘要助手。", task="summarize")
+    ids = tok.encode(text, add_special_tokens=False)
+    assert tok.system_token_id in ids
+    assert tok.task_token_ids["summarize"] in ids
+    # system + task tokens come before the first supervised span
+    first_span_char = spans[0][0]
+    enc = tok._tok.encode(text, add_special_tokens=False)
+    for tid, off in zip(enc.ids, enc.offsets):
+        if tid in (tok.system_token_id, tok.task_token_ids["summarize"]):
+            assert off[0] < first_span_char

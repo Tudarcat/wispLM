@@ -37,8 +37,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+# Bumped whenever the corpus/sampler API changes, so train.py can tell
+# "the data has no mask" apart from "you only copied half of the update".
+DATA_REV = 2
+
 __all__ = [
     "TokenizedCorpus",
+    "DATA_REV",
     "MixtureBlockSampler",
     "BatchPrefetcher",
     "PrefetchedBatch",
@@ -73,6 +78,25 @@ class TokenizedCorpus:
             raise ValueError(
                 f"{self.name}: {self.bin_path} has {len(self.tokens)} tokens, meta says {self.num_tokens}"
             )
+        # optional per-token loss mask (SFT): 1 = compute loss on this token
+        self.mask: Optional[np.ndarray] = None
+        self.mask_auto_detected = False
+        mask_file = self.meta.get("mask_file")
+        if mask_file is None:
+            # meta.json may be stale (e.g. mask.bin was copied in afterwards).
+            # Trust the file on disk rather than refusing to train.
+            if os.path.exists(os.path.join(root, "mask.bin")):
+                mask_file = "mask.bin"
+                self.mask_auto_detected = True
+        if mask_file:
+            mask_path = os.path.join(root, mask_file)
+            if not os.path.exists(mask_path):
+                raise FileNotFoundError(f"{self.name}: mask_file {mask_path} is missing")
+            self.mask = (np.fromfile(mask_path, dtype=np.uint8) if in_memory
+                         else np.memmap(mask_path, dtype=np.uint8, mode="r"))
+            if len(self.mask) != self.num_tokens:
+                raise ValueError(f"{self.name}: mask has {len(self.mask)} entries, "
+                                 f"meta says {self.num_tokens}")
         self.in_memory = in_memory
         self.nbytes = self.num_tokens * self.dtype.itemsize
 
@@ -135,6 +159,13 @@ class MixtureBlockSampler:
         for c in self.corpora:
             if c.dtype != dtype:
                 raise ValueError(f"mixed dtypes ({c.name}: {c.dtype} vs {dtype}) are not supported")
+        self.has_mask = any(c.mask is not None for c in self.corpora)
+        if self.has_mask and not all(c.mask is not None for c in self.corpora):
+            raise ValueError(
+                "mixed mask availability: "
+                f"{[(c.name, c.mask is not None) for c in self.corpora]}; "
+                "tokenize the whole SFT set in one run"
+            )
 
         # disjoint blocks: sample i covers tokens [i*L, i*L + L]
         self.n_samples = [(c.num_tokens - 1) // self.block_size for c in self.corpora]
@@ -209,21 +240,37 @@ class MixtureBlockSampler:
         self.pos = 0
 
     # ------------------------------------------------------------------
+    def _next_span(self) -> Tuple[int, int]:
+        """Advance the schedule by one sample; return ``(corpus_idx, start_token)``."""
+        if self.pos >= self.steps_per_epoch:
+            self._build_epoch(self.epoch + 1)
+        ci = int(self.assignment[self.pos])
+        self.pos += 1
+        block = int(self.queues[ci][self.ptrs[ci]])
+        self.ptrs[ci] += 1
+        return ci, block * self.block_size
+
     def next_batch(self, batch_size: int, out: Optional[np.ndarray] = None) -> np.ndarray:
         """Return ``[batch_size, block_size + 1]`` of token ids."""
         L = self.block_size
         if out is None:
             out = np.empty((batch_size, L + 1), dtype=np.int32)
         for j in range(batch_size):
-            if self.pos >= self.steps_per_epoch:
-                self._build_epoch(self.epoch + 1)
-            ci = int(self.assignment[self.pos])
-            self.pos += 1
-            block = int(self.queues[ci][self.ptrs[ci]])
-            self.ptrs[ci] += 1
-            start = block * L
+            ci, start = self._next_span()
             out[j] = self.corpora[ci].tokens[start:start + L + 1]
         return out
+
+    def next_batch_masked(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Same draw as :meth:`next_batch`, but also return the loss mask."""
+        L = self.block_size
+        ids = np.empty((batch_size, L + 1), dtype=np.int32)
+        msk = np.empty((batch_size, L + 1), dtype=np.uint8)
+        for j in range(batch_size):
+            ci, start = self._next_span()
+            corpus = self.corpora[ci]
+            ids[j] = corpus.tokens[start:start + L + 1]
+            msk[j] = corpus.mask[start:start + L + 1]
+        return ids, msk
 
     def next_val_batch(self, batch_size: int, out: Optional[np.ndarray] = None) -> np.ndarray:
         """Fixed-order validation blocks (deterministic, no shuffling)."""
@@ -238,6 +285,20 @@ class MixtureBlockSampler:
             start = block * L
             out[j] = self.corpora[ci].tokens[start:start + L + 1]
         return out
+
+    def next_val_batch_masked(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        L = self.block_size
+        if not self._val_blocks:
+            raise ValueError("no validation blocks (val_fraction=0?)")
+        ids = np.empty((batch_size, L + 1), dtype=np.int32)
+        msk = np.empty((batch_size, L + 1), dtype=np.uint8)
+        for j in range(batch_size):
+            ci, block = self._val_blocks[self._val_pos % len(self._val_blocks)]
+            self._val_pos += 1
+            start = block * L
+            ids[j] = self.corpora[ci].tokens[start:start + L + 1]
+            msk[j] = self.corpora[ci].mask[start:start + L + 1]
+        return ids, msk
 
     def reset_val(self) -> None:
         self._val_pos = 0
@@ -279,6 +340,7 @@ class PrefetchedBatch:
     input_ids: torch.Tensor          # [B, L] int64 on device
     sampler_state: dict              # state *after* this batch was drawn
     seq_len: int
+    loss_mask: Optional[torch.Tensor] = None   # [B, L] bool: 1 = compute loss here (SFT)
 
 
 class BatchPrefetcher:
@@ -317,16 +379,25 @@ class BatchPrefetcher:
     def _worker(self) -> None:
         try:
             while not self._stop.is_set():
-                arr = self.sampler.next_batch(self.batch_size)          # [B, L+1] int32
+                if self.sampler.has_mask:
+                    arr, msk = self.sampler.next_batch_masked(self.batch_size)   # [B, L+1]
+                else:
+                    arr, msk = self.sampler.next_batch(self.batch_size), None
                 state = self.sampler.state_dict()
                 cpu = torch.from_numpy(arr[:, :-1]).to(torch.int64)     # copy, releases numpy mem
+                mask_t = None
+                if msk is not None:
+                    # aligned with input_ids: position i's label is input_ids[i]
+                    mask_t = torch.from_numpy(msk[:, : self.seq_len].copy()).to(torch.bool)
                 if self.pin_memory:
                     cpu = cpu.pin_memory()
+                    if mask_t is not None:
+                        mask_t = mask_t.pin_memory()
                 else:
                     cpu = cpu.contiguous()
                 while not self._stop.is_set():
                     try:
-                        self._q.put((cpu, state), timeout=0.5)
+                        self._q.put((cpu, mask_t, state), timeout=0.5)
                         break
                     except _queue.Full:
                         continue
@@ -337,23 +408,30 @@ class BatchPrefetcher:
     # -- consumer ------------------------------------------------------
     def next(self) -> PrefetchedBatch:
         if self.validation:
-            arr = self.sampler.next_val_batch(self.batch_size)
+            if self.sampler.has_mask:
+                arr, msk = self.sampler.next_val_batch_masked(self.batch_size)
+                mask_t = torch.from_numpy(msk[:, : self.seq_len].copy()).to(torch.bool)
+            else:
+                arr, mask_t = self.sampler.next_val_batch(self.batch_size), None
             cpu = torch.from_numpy(arr[:, :-1]).to(torch.int64)
             return PrefetchedBatch(
                 cpu.to(self.device, non_blocking=self.pin_memory),
                 self.sampler.state_dict(), self.seq_len,
+                None if mask_t is None else mask_t.to(self.device),
             )
         while True:
             if self._exc is not None:
                 raise RuntimeError("prefetch worker failed") from self._exc
             try:
-                cpu, state = self._q.get(timeout=0.5)
+                cpu, mask_t, state = self._q.get(timeout=0.5)
                 break
             except _queue.Empty:
                 if not self._thread.is_alive() and self._q.empty():
                     raise RuntimeError("prefetch worker died") from self._exc
         return PrefetchedBatch(
-            cpu.to(self.device, non_blocking=self.pin_memory), state, self.seq_len)
+            cpu.to(self.device, non_blocking=self.pin_memory), state, self.seq_len,
+            None if mask_t is None else mask_t.to(self.device),
+        )
 
     def __iter__(self) -> "BatchPrefetcher":
         return self

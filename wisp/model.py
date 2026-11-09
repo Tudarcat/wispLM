@@ -62,23 +62,25 @@ def chunked_lm_loss(
     logits are freed after every chunk instead of holding ``[B, L, vocab]``.
 
     The head is evaluated in fp32 (the logits are cast, not the weights) since
-    a bf16 log_softmax over 24k classes loses too much precision.
+    a bf16 log_softmax over 24k classes loses too much precision.  The fp32 copy
+    of the head is made **once** for all chunks, not per chunk.
     """
     seq_len = hidden_states.size(1)
-    weight = lm_head_weight
+    weight = lm_head_weight.float()   # 74 MB once, instead of per chunk
     total_loss = hidden_states.new_zeros(())
-    total_count = 0
+    total_count = torch.zeros((), dtype=torch.long, device=hidden_states.device)
     for start in range(0, seq_len - 1, chunk_size):
         end = min(start + chunk_size, seq_len - 1)
         h = hidden_states[:, start:end].reshape(-1, hidden_states.size(-1)).float()
         y = labels[:, start + 1: end + 1].reshape(-1)
-        logits = F.linear(h, weight.float())
-        n = int((y != -100).sum().item())
-        total_count += n
-        if n:
-            total_loss = total_loss + F.cross_entropy(logits, y, ignore_index=-100, reduction="sum")
+        logits = F.linear(h, weight)
+        # everything below stays on-device: calling .item() here breaks the
+        # torch.compile graph (dynamo cannot trace a device->host sync)
+        valid = y != -100
+        total_count = total_count + valid.sum()
+        total_loss = total_loss + F.cross_entropy(logits, y, ignore_index=-100, reduction="sum")
         del logits
-    return total_loss / max(total_count, 1)
+    return total_loss / total_count.clamp(min=1).to(total_loss.dtype)
 
 
 class WispModel(nn.Module):

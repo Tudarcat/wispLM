@@ -183,3 +183,77 @@ def prompt_prefix(tok, system: Optional[str] = None, task: Optional[str] = None)
     if task and task in tok.task_token_ids:
         out.append(tok.reserved_name(tok.task_token_ids[task]))
     return "".join(out) + tok.reserved_name(tok.user_token_id)
+
+
+# ----------------------------------------------------------------------
+def build_sft_sample(
+    doc: QADocument,
+    tok,
+    max_passage_chars: int = 6000,
+    max_answers: int = 12,
+    task: Optional[str] = None,
+    system: Optional[str] = None,
+) -> Tuple[str, List[Tuple[int, int]]]:
+    """Like :func:`format_conversation`, but also return the **loss spans**.
+
+    Returns ``(text, spans)`` where each span is a ``(start_char, end_char)``
+    range covering one assistant turn *including* the ``<|end_of_turn|>`` that
+    closes it.  Everything outside those spans (system prompt, user turns, the
+    ``<|assistant|>`` marker itself) must be masked out of the loss.
+
+    The spans are character offsets, so the tokenizer's per-token ``offsets``
+    map them to token positions exactly -- no re-tokenising, no guessing from
+    marker ids (which breaks when a turn is split across block boundaries).
+    """
+    if not doc.is_usable:
+        return "", []
+    if not tok.is_wispv1_patched:
+        raise RuntimeError("run `python scripts/setup_special_tokens.py` first")
+    eot = tok.reserved_name(tok.end_of_turn_token_id)
+    user = tok.reserved_name(tok.user_token_id)
+    assistant = tok.reserved_name(tok.assistant_token_id)
+    parts: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+
+    def add(s: str) -> None:
+        nonlocal pos
+        parts.append(s)
+        pos += len(s)
+
+    add(tok.bos_token)
+    if system:
+        add(tok.reserved_name(tok.system_token_id))
+        add(system)
+        add(eot)
+    if task and task in tok.task_token_ids:
+        add(tok.reserved_name(tok.task_token_ids[task]))
+
+    pairs = doc.pairs[:max_answers]
+    passage = (doc.passage[:max_passage_chars].strip() + "\n\n") if doc.passage else ""
+    for i, pair in enumerate(pairs):
+        add(user)
+        add((passage if i == 0 else "") + pair.question)
+        add(eot)
+        add(assistant)
+        start = pos                      # loss starts right after <|assistant|>
+        add(pair.answer)
+        add(eot)                         # ... and includes the closing marker
+        spans.append((start, pos))
+    add(tok.eos_token)
+    return "".join(parts), spans
+
+
+def spans_to_mask(offsets: List[Tuple[int, int]], spans: List[Tuple[int, int]]) -> List[int]:
+    """1 for every token that starts inside one of ``spans``."""
+    if not spans:
+        return [0] * len(offsets)
+    mask = []
+    for a, _b in offsets:
+        inside = False
+        for s, e in spans:
+            if s <= a < e:
+                inside = True
+                break
+        mask.append(1 if inside else 0)
+    return mask
